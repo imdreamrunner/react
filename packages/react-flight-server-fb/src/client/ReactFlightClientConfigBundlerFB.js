@@ -20,6 +20,10 @@ import type {ModuleLoading} from 'react-client/src/ReactFlightClientConfig';
 
 import {canUseDOM} from 'shared/ExecutionEnvironment';
 
+import hasOwnProperty from 'shared/hasOwnProperty';
+
+import {isServerReference} from '../ReactFlightFBReferences';
+
 export type ServerConsumerModuleMap = null;
 
 export type ServerManifest = null;
@@ -64,11 +68,24 @@ export function resolveServerReference<T>(
   config: ServerManifest,
   id: ServerReferenceId,
 ): ClientReference<T> {
-  return {
+  const reference: ClientReference<T> = {
     $$typeof: Symbol.for('react.client.reference'),
     $$id: id,
     $$hblp: null,
   } as any;
+  if (!canUseDOM) {
+    // On the server the id comes from an untrusted reply and there is no
+    // manifest to validate it against, so require the module and confirm the
+    // export was registered via registerServerReference. This stops an
+    // arbitrary id from resolving to an unrelated module export.
+    const resolvedModule = requireModule<T>(reference);
+    if (resolvedModule == null || !isServerReference(resolvedModule as any)) {
+      throw new Error(
+        'Could not resolve "' + id + '" to a registered Server Reference.',
+      );
+    }
+  }
+  return reference;
 }
 
 const asyncModuleCache: Map<string, Thenable<any>> = new Map();
@@ -125,7 +142,10 @@ export function requireModule<T>(metadata: ClientReference<T>): T {
       if (exportName === '' || exportName === 'default') {
         return mod.__esModule ? mod.default : mod;
       }
-      return mod[exportName];
+      if (hasOwnProperty.call(mod, exportName)) {
+        return mod[exportName];
+      }
+      return undefined as any;
     }
     // Use .call to prevent bundlers from statically resolving this require.
     return require.call(null, id); // eslint-disable-line no-useless-call
