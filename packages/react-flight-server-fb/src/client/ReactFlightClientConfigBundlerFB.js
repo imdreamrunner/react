@@ -20,6 +20,8 @@ import type {ModuleLoading} from 'react-client/src/ReactFlightClientConfig';
 
 import {canUseDOM} from 'shared/ExecutionEnvironment';
 
+import hasOwnProperty from 'shared/hasOwnProperty';
+
 export type ServerConsumerModuleMap = null;
 
 export type ServerManifest = null;
@@ -73,12 +75,65 @@ export function resolveServerReference<T>(
 
 const asyncModuleCache: Map<string, Thenable<any>> = new Map();
 
+// A Server Reference id is "moduleName#exportName"; a Client Reference id is the
+// bare module name. JSResource is keyed by module name, so strip any export.
+function getModuleName(id: string): string {
+  const idx = id.lastIndexOf('#');
+  return idx === -1 ? id : id.slice(0, idx);
+}
+
+// Select the referenced value from a loaded module. Client References resolve to
+// the whole module; Server References resolve to a named export.
+function selectModuleExport<T>(moduleExports: any, id: string): T {
+  const idx = id.lastIndexOf('#');
+  if (idx === -1) {
+    return moduleExports;
+  }
+  const exportName = id.slice(idx + 1);
+  if (exportName === '' || exportName === 'default') {
+    return moduleExports.__esModule ? moduleExports.default : moduleExports;
+  }
+  // Read only the module's own exports so an id cannot reach prototype-chain
+  // properties (e.g. the Function constructor).
+  if (hasOwnProperty.call(moduleExports, exportName)) {
+    return moduleExports[exportName];
+  }
+  return undefined as any;
+}
+
+function trackModulePromise(id: string, modulePromise: Thenable<any>): void {
+  modulePromise.then(
+    value => {
+      const fulfilledThenable: FulfilledThenable<mixed> = modulePromise as any;
+      fulfilledThenable.status = 'fulfilled';
+      fulfilledThenable.value = value;
+    },
+    reason => {
+      const rejectedThenable: RejectedThenable<mixed> = modulePromise as any;
+      rejectedThenable.status = 'rejected';
+      rejectedThenable.reason = reason;
+    },
+  );
+  asyncModuleCache.set(id, modulePromise);
+}
+
 export function preloadModule<T>(
   metadata: ClientReference<T>,
 ): null | Thenable<any> {
   if (!canUseDOM) {
-    // Server environment: modules are synchronously available via require().
-    return null;
+    // On the server we no longer assume modules are synchronously require()-able.
+    // A HaaS 2.0 session can load Haste modules on demand via the bootloader
+    // installed by HaaSUtils.enableJSResourceLoading(), so kick off an async
+    // JSResource load and let the consumer block on this chunk until it resolves.
+    // $FlowFixMe[cannot-resolve-module] JSResource is a Meta-internal module
+    const serverJsr: any = require('JSResource')(getModuleName(metadata.$$id));
+    if (serverJsr.getModuleIfRequireable() != null) {
+      // Already evaluated in this session; requireModule can read it synchronously.
+      return null;
+    }
+    const serverModulePromise: Thenable<T> = serverJsr.load();
+    trackModulePromise(metadata.$$id, serverModulePromise);
+    return serverModulePromise;
   }
 
   // $FlowFixMe[cannot-resolve-module] JSResource is a Meta-internal module
@@ -95,40 +150,31 @@ export function preloadModule<T>(
   }
 
   const modulePromise: Thenable<T> = jsr.load();
-  modulePromise.then(
-    value => {
-      const fulfilledThenable: FulfilledThenable<mixed> = modulePromise as any;
-      fulfilledThenable.status = 'fulfilled';
-      fulfilledThenable.value = value;
-    },
-    reason => {
-      const rejectedThenable: RejectedThenable<mixed> = modulePromise as any;
-      rejectedThenable.status = 'rejected';
-      rejectedThenable.reason = reason;
-    },
-  );
-  asyncModuleCache.set(metadata.$$id, modulePromise);
+  trackModulePromise(metadata.$$id, modulePromise);
   return modulePromise;
 }
 
 export function requireModule<T>(metadata: ClientReference<T>): T {
   if (!canUseDOM) {
-    // When the Flight client runs on the server to consume a Flight stream,
-    // modules are resolved synchronously via require() with Haste module names.
+    // Read the module preloadModule made available — synchronously if it was
+    // already evaluated, otherwise from the resolved async JSResource load.
     const id = metadata.$$id;
-    const idx = id.lastIndexOf('#');
-    if (idx !== -1) {
-      const moduleName = id.slice(0, idx);
-      const exportName = id.slice(idx + 1);
-      // Use .call to prevent bundlers from statically resolving this require.
-      const mod = require.call(null, moduleName); // eslint-disable-line no-useless-call
-      if (exportName === '' || exportName === 'default') {
-        return mod.__esModule ? mod.default : mod;
+    // $FlowFixMe[cannot-resolve-module] JSResource is a Meta-internal module
+    const serverJsr: any = require('JSResource')(getModuleName(id));
+    let moduleExports = serverJsr.getModuleIfRequireable();
+    if (moduleExports == null) {
+      const promise: any = asyncModuleCache.get(id);
+      if (promise != null && promise.status === 'fulfilled') {
+        moduleExports = promise.value;
+      } else if (promise != null) {
+        throw promise.reason;
+      } else {
+        throw new Error(
+          'Could not require module "' + id + '" because it was not preloaded.',
+        );
       }
-      return mod[exportName];
     }
-    // Use .call to prevent bundlers from statically resolving this require.
-    return require.call(null, id); // eslint-disable-line no-useless-call
+    return selectModuleExport(moduleExports, id);
   }
 
   // $FlowFixMe[cannot-resolve-module] JSResource is a Meta-internal module
