@@ -62,8 +62,8 @@ export function resolveServerReference<T>(
   config: ServerManifest,
   id: ServerReferenceId,
 ): ClientReference<T> {
-  // TODO (T276253725): Add a registered server-action manifest that authorizes
-  // IDs before module loading, plus own-export checks, before enabling decoding.
+  // Decoding requires a registered server-action manifest that authorizes IDs
+  // before module loading, plus own-export checks.
   throw new Error(
     'Server-reference decoding is not supported by the FB Flight bundler.',
   );
